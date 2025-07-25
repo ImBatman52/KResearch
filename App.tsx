@@ -129,7 +129,7 @@ const AppContent: React.FC = () => {
 
         <GlassCard className="p-6 sm:p-8 flex flex-col gap-6">
           <header className="text-center">
-            <h1 className="text-4xl sm:text-5xl font-bold tracking-tight">KResearch</h1>
+            <h1 className="text-4xl sm:text-5xl font-bold tracking-tight">BatResearch</h1>
             <p className="mt-2 text-base text-gray-600 dark:text-gray-400">{t('appTagline')}</p>
           </header>
 
@@ -257,7 +257,7 @@ const AppContent: React.FC = () => {
       />
       
       <footer className="mt-8 text-center text-sm text-gray-500 dark:text-gray-400">
-        <p>&copy; {new Date().getFullYear()} KResearch. {t('footerPoweredBy')}</p>
+        <p>&copy; {new Date().getFullYear()} BatResearch. {t('footerPoweredBy')}</p>
       </footer>
     </div>
   );
