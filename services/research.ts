@@ -1,9 +1,40 @@
+
+
+
+
 import { runDynamicConversationalPlanner } from './planner';
 import { executeSingleSearch } from './search';
 import { synthesizeReport } from './synthesis';
 import { settingsService } from './settingsService';
 import { ResearchUpdate, Citation, FinalResearchData, ResearchMode, FileData, Role } from '../types';
-import { generateOutline } from './outline';
+
+/**
+ * Executes a set of search queries and synthesizes the results.
+ * @returns A structured update for the research log and a list of new citations.
+ */
+const performSearchAndRead = async (
+    searchQueries: string[],
+    mode: ResearchMode,
+    checkSignal: () => void,
+): Promise<{ readUpdateContent: Omit<ResearchUpdate, 'id' | 'persona'>; newCitations: Citation[] }> => {
+    checkSignal();
+
+    const searchPromises = searchQueries.map(q => executeSingleSearch(q, mode));
+    const searchResults = await Promise.all(searchPromises);
+    checkSignal();
+
+    const readContents = searchResults.map(r => r.text);
+    const combinedCitations = searchResults.flatMap(r => r.citations);
+
+    const readUpdateContent = {
+        type: 'read' as const,
+        content: readContents,
+        source: Array.from(new Set(combinedCitations.map(c => c.url)))
+    };
+
+    return { readUpdateContent, newCitations: combinedCitations };
+};
+
 
 export const runIterativeDeepResearch = async (
   query: string,
@@ -28,7 +59,7 @@ export const runIterativeDeepResearch = async (
   existingHistory.forEach(update => {
       if (update.type === 'read' && Array.isArray(update.source)) {
           update.source.forEach(url => {
-              if (!allCitations.some(c => c.url === url)) {
+              if (typeof url === 'string' && !allCitations.some(c => c.url === url)) {
                   allCitations.push({ url, title: url });
               }
           });
@@ -36,22 +67,32 @@ export const runIterativeDeepResearch = async (
   });
 
   const { maxCycles } = settingsService.getSettings().researchParams;
-  let internalSearchCycles = 0;
   
   const checkSignal = () => {
     if (signal.aborted) throw new DOMException('Research aborted by user.', 'AbortError');
   }
+  
+  // Recovery logic for a failed search/read step
+  const lastUpdate = history.length > 0 ? history[history.length - 1] : null;
+  if (lastUpdate && lastUpdate.type === 'search') {
+    const searchQueries = Array.isArray(lastUpdate.content) ? lastUpdate.content : [String(lastUpdate.content)];
+    console.log('Recovering from a previous state. Retrying last search action.', searchQueries);
 
-  const onPlannerUpdate = (update: ResearchUpdate) => {
-    history.push(update);
-    onUpdate(update);
-  };
+    const { readUpdateContent, newCitations } = await performSearchAndRead(searchQueries, mode, checkSignal);
+    allCitations.push(...newCitations);
 
+    const readUpdate = {
+        id: idCounter.current++,
+        ...readUpdateContent
+    };
+    history.push(readUpdate);
+    onUpdate(readUpdate);
+  }
+  
   while (true) {
     checkSignal();
     const totalSearchUpdates = history.filter(h => h.type === 'search').length;
-    // The initial search happens before this loop. It shouldn't count towards the max cycle limit.
-    internalSearchCycles = initialSearchResult ? Math.max(0, totalSearchUpdates - 1) : totalSearchUpdates;
+    const internalSearchCycles = initialSearchResult ? Math.max(0, totalSearchUpdates - 1) : totalSearchUpdates;
 
     if (internalSearchCycles >= maxCycles) {
         const finishUpdate = { id: idCounter.current++, type: 'thought' as const, content: `Maximum research cycles (${maxCycles}) reached. Forcing conclusion to synthesize report.` };
@@ -63,8 +104,10 @@ export const runIterativeDeepResearch = async (
     await new Promise(resolve => setTimeout(resolve, 1000));
     checkSignal();
     
-    // The planner needs the *total* number of searches to make decisions about minCycles.
-    const plan = await runDynamicConversationalPlanner(query, history, onPlannerUpdate, checkSignal, idCounter, mode, clarifiedContext, fileData, role, totalSearchUpdates);
+    const plan = await runDynamicConversationalPlanner(query, history, (update) => {
+        history.push(update);
+        onUpdate(update);
+    }, checkSignal, idCounter, mode, clarifiedContext, fileData, role, totalSearchUpdates);
     
     checkSignal();
 
@@ -83,21 +126,12 @@ export const runIterativeDeepResearch = async (
       history.push(searchUpdate);
       onUpdate(searchUpdate);
       
-      checkSignal();
-
-      const searchPromises = searchQueries.map(q => executeSingleSearch(q, mode));
-      const searchResults = await Promise.all(searchPromises);
-      checkSignal();
-      
-      const readContents = searchResults.map(r => r.text);
-      const combinedCitations = searchResults.flatMap(r => r.citations);
-      allCitations.push(...combinedCitations);
+      const { readUpdateContent, newCitations } = await performSearchAndRead(searchQueries, mode, checkSignal);
+      allCitations.push(...newCitations);
       
       const readUpdate = { 
         id: idCounter.current++, 
-        type: 'read' as const, 
-        content: readContents, 
-        source: Array.from(new Set(combinedCitations.map(c => c.url))) 
+        ...readUpdateContent
       };
       history.push(readUpdate);
       onUpdate(readUpdate);
@@ -110,14 +144,17 @@ export const runIterativeDeepResearch = async (
   }
   
   checkSignal();
-  const outlineUpdate = { id: idCounter.current++, type: 'outline' as const, content: 'Generating report outline...' };
-  history.push(outlineUpdate);
-  onUpdate(outlineUpdate);
-  const reportOutline = await generateOutline(query, history, mode, fileData, role);
-  
-  checkSignal();
-  const finalReportData = await synthesizeReport(query, history, allCitations, mode, fileData, role, reportOutline);
+  const synthesisMessage = { id: idCounter.current++, type: 'thought' as const, content: 'Synthesizing final report...' };
+  history.push(synthesisMessage);
+  onUpdate(synthesisMessage);
+
+  // Directly call synthesizeReport, passing an empty string for the outline.
+  // The synthesis prompt will handle the lack of an outline.
+  const finalReportData = await synthesizeReport(query, history, allCitations, mode, fileData, role, "");
+
   const uniqueCitations = Array.from(new Map(allCitations.map(c => [c.url, c])).values());
+  const totalSearchUpdates = history.filter(h => h.type === 'search').length;
+  const internalSearchCycles = initialSearchResult ? Math.max(0, totalSearchUpdates - 1) : totalSearchUpdates;
 
   return { 
     ...finalReportData, 
